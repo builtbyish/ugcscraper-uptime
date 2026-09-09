@@ -1,0 +1,107 @@
+name: Uptime check
+
+# External liveness probe for production, running OUTSIDE both Vercel and the VPS (GitHub's
+# runners), so it cannot share their failure. Why it exists (2026-09-09): the error log and the
+# Slack error alerts are written to the production database, so a database/pooler outage is
+# invisible to both -- /admin/errors showed nothing for a 13-minute full outage. This is the one
+# monitor that still works when the database doesn't.
+#
+# Alerting: a failed run makes GitHub email the repository owner (default notification setting for
+# failed scheduled workflows -- no setup needed). If the SLACK_WEBHOOK_URL repository secret is set
+# (the same Incoming Webhook the app uses for RPS_SLACK_WEBHOOK_URL), it also posts to Slack:
+#     gh secret set SLACK_WEBHOOK_URL -R builtbyish/ugcscraper-uptime
+# Cadence: every 5 minutes (GitHub's minimum; schedules can lag several minutes under load).
+# This lives in its own PUBLIC repository on purpose: public repos get unlimited Actions minutes
+# (a 5-minute probe is ~8,600 minutes/month, far past a private repo's free 2,000), and the
+# schedule in the private product repo never fired at all on 2026-09-09.
+#
+# Status page: every non-drill run also reports its result to POST /cron/uptime (Bearer
+# RPS_CRON_SECRET, the same value the API has in its environment), which is what feeds the
+# "Independent monitor" line and the external-checks strip on ugcscraper.com/status:
+#     gh secret set RPS_CRON_SECRET -R builtbyish/ugcscraper-uptime
+# A report that cannot be delivered (the API itself is down) is expected and not an error here;
+# the resulting gap in the recorded checks is visible on the status page as "no result received".
+
+on:
+  schedule:
+    - cron: "3-59/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: "Override the API status URL (for drills, e.g. a URL that returns 500)"
+        required: false
+        default: "https://api.ugcscraper.com/v1/status"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    env:
+      API_URL: ${{ github.event.inputs.api_url || 'https://api.ugcscraper.com/v1/status' }}
+      SITE_URL: https://ugcscraper.com/
+    steps:
+      - name: Probe API and site (one retry after 20s to ignore a single blip)
+        id: probe
+        shell: bash
+        run: |
+          set +e
+          check() {  # $1 = url, $2 = required body substring ("" = none)
+            local url="$1" want="$2" code body
+            for attempt in 1 2; do
+              body=$(curl -sS --max-time 20 -o /dev/stdout -w '\n%{http_code}' "$url" 2>&1)
+              code=${body##*$'\n'}; body=${body%$'\n'*}
+              if [ "$code" = "200" ] && { [ -z "$want" ] || grep -q "$want" <<<"$body"; }; then
+                echo "OK   $url -> $code"; return 0
+              fi
+              echo "FAIL $url -> HTTP ${code:-none} (attempt $attempt): ${body:0:160}"
+              [ "$attempt" = 1 ] && sleep 20
+            done
+            return 1
+          }
+          failed=""
+          check "$API_URL"  '"operational":true' || failed="$failed api"
+          check "$SITE_URL" ''                   || failed="$failed site"
+          echo "failed=${failed# }" >> "$GITHUB_OUTPUT"
+          [ -z "$failed" ]
+
+      - name: Alert Slack (only when the probe failed and a webhook secret exists)
+        if: failure() && steps.probe.outcome == 'failure'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          FAILED: ${{ steps.probe.outputs.failed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No SLACK_WEBHOOK_URL secret set; relying on GitHub's failed-run email."; exit 0
+          fi
+          payload=$(printf '{"text":":rotating_light: *UGC Scraper uptime check FAILED* (%s) - twice in a row, 20s apart.\nAPI: %s\nRun: %s"}' "$FAILED" "$API_URL" "$RUN_URL")
+          curl -sS --max-time 15 -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null && echo "Slack alerted."
+
+      - name: Report the result to the status page (skipped for drills against another URL)
+        if: always() && steps.probe.outcome != 'skipped'
+        env:
+          CRON_SECRET: ${{ secrets.RPS_CRON_SECRET }}
+          OUTCOME: ${{ steps.probe.outcome }}
+          FAILED: ${{ steps.probe.outputs.failed }}
+        shell: bash
+        run: |
+          if [ "$API_URL" != "https://api.ugcscraper.com/v1/status" ]; then
+            echo "Drill run against $API_URL; not reported to the status page."; exit 0
+          fi
+          if [ -z "$CRON_SECRET" ]; then
+            echo "No RPS_CRON_SECRET secret set; result not reported to the status page."; exit 0
+          fi
+          ok=false; [ "$OUTCOME" = "success" ] && ok=true
+          payload=$(printf '{"ok":%s,"failed":"%s","source":"github"}' "$ok" "$FAILED")
+          code=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $CRON_SECRET" -H 'Content-Type: application/json' \
+            --data "$payload" https://api.ugcscraper.com/cron/uptime || true)
+          echo "Reported ok=$ok failed='$FAILED' -> HTTP ${code:-none} (non-200 is expected while the API is down)"
