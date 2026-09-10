@@ -22,6 +22,9 @@ name: Uptime check
 # A report that cannot be delivered (the API itself is down) is expected and not an error here;
 # the resulting gap in the recorded checks is visible on the status page as "no result received".
 
+# Scheduled runs execute as the LAST committer of this file, who must have write access to the
+# repository. Commit changes to this file as the repository owner (builtbyish), not from a
+# personal account, or the schedule silently stops (this bit us on 2026-09-10).
 on:
   schedule:
     - cron: "3-59/5 * * * *"
