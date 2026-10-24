@@ -7,9 +7,10 @@ name: Uptime check
 # monitor that still works when the database doesn't.
 #
 # Alerting: a failed run makes GitHub email the repository owner (default notification setting for
-# failed scheduled workflows -- no setup needed). If the SLACK_WEBHOOK_URL repository secret is set
-# (the same Incoming Webhook the app uses for RPS_SLACK_WEBHOOK_URL), it also posts to Slack:
-#     gh secret set SLACK_WEBHOOK_URL -R builtbyish/ugcscraper-uptime
+# failed scheduled workflows -- no setup needed). If the ALERT_WEBHOOK_URL repository secret is set
+# (the same incoming webhook the app uses -- Discord since 2026-10-24; the legacy SLACK_WEBHOOK_URL
+# secret is still honoured), it also posts there:
+#     gh secret set ALERT_WEBHOOK_URL -R builtbyish/ugcscraper-uptime
 # Cadence: every 5 minutes (GitHub's minimum; schedules can lag several minutes under load).
 # This lives in its own PUBLIC repository on purpose: public repos get unlimited Actions minutes
 # (a 5-minute probe is ~8,600 minutes/month, far past a private repo's free 2,000), and the
@@ -74,19 +75,22 @@ jobs:
           echo "failed=${failed# }" >> "$GITHUB_OUTPUT"
           [ -z "$failed" ]
 
-      - name: Alert Slack (only when the probe failed and a webhook secret exists)
+      - name: Alert the webhook (only when the probe failed and a webhook secret exists)
         if: failure() && steps.probe.outcome == 'failure'
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Discord (since 2026-10-24) or Slack: the payload carries both "content" and "text",
+          # each side ignores the other's key.
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL || secrets.SLACK_WEBHOOK_URL }}
           FAILED: ${{ steps.probe.outputs.failed }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |
-          if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "No SLACK_WEBHOOK_URL secret set; relying on GitHub's failed-run email."; exit 0
+          if [ -z "$ALERT_WEBHOOK_URL" ]; then
+            echo "No ALERT_WEBHOOK_URL secret set; relying on GitHub's failed-run email."; exit 0
           fi
-          payload=$(printf '{"text":":rotating_light: *UGC Scraper uptime check FAILED* (%s) - twice in a row, 20s apart.\nAPI: %s\nRun: %s"}' "$FAILED" "$API_URL" "$RUN_URL")
-          curl -sS --max-time 15 -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null && echo "Slack alerted."
+          msg=$(printf '🚨 **UGC Scraper uptime check FAILED** (%s) - twice in a row, 20s apart.\nAPI: %s\nRun: %s' "$FAILED" "$API_URL" "$RUN_URL")
+          payload=$(printf '{"content":"%s","text":"%s"}' "$msg" "$msg")
+          curl -sS --max-time 15 -X POST -H 'Content-type: application/json' --data "$payload" "$ALERT_WEBHOOK_URL" >/dev/null && echo "Alert sent."
 
       - name: Report the result to the status page (skipped for drills against another URL)
         if: always() && steps.probe.outcome != 'skipped'
